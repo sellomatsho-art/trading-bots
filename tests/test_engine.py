@@ -44,7 +44,10 @@ class FakeSession:
             return FakeResponse(self._ensemble(params))
         if "daily" in params:
             return FakeResponse(self._observed(params))
-        return FakeResponse(self.markets if params.get("offset", 0) == 0 else [])
+        # public-search returns grouped results as a dict, not a bare list.
+        # fetch_markets queries several terms and dedupes by id, so serving
+        # the same payload each time is fine.
+        return FakeResponse({"markets": self.markets, "events": []})
 
     def _city_for(self, params):
         from weatherbot.cities import CITIES

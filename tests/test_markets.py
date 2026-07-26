@@ -111,13 +111,19 @@ def test_a_network_failure_surfaces_as_a_typed_error_not_a_traceback():
         fetch_markets(DeadSession())
 
 
-def test_fetch_markets_stops_paging_on_a_short_batch():
-    class PagedSession:
+def test_fetch_markets_queries_search_dedupes_and_drops_closed():
+    """Weather markets are too low-volume for the volume-ordered listing,
+    which also 422s past an offset ceiling. fetch_markets uses search instead:
+    several terms, results deduped by id, settled markets discarded."""
+
+    class SearchSession:
         def __init__(self):
-            self.offsets = []
+            self.urls = []
+            self.terms = []
 
         def get(self, url, params=None, timeout=None):
-            self.offsets.append(params["offset"])
+            self.urls.append(url)
+            self.terms.append(params["q"])
 
             class R:
                 @staticmethod
@@ -126,10 +132,53 @@ def test_fetch_markets_stops_paging_on_a_short_batch():
 
                 @staticmethod
                 def json():
-                    return [_raw()] * 3
+                    return {
+                        "markets": [_raw()],
+                        "events": [
+                            {"markets": [_raw(id="999", closed=True)]},
+                        ],
+                    }
 
             return R()
 
-    session = PagedSession()
-    assert len(fetch_markets(session)) == 3
-    assert session.offsets == [0], "one short page ends the scan"
+    session = SearchSession()
+    out = fetch_markets(session)
+
+    assert len(out) == 1, "one live market, deduped across terms; closed one dropped"
+    assert out[0]["id"] == "512345"
+    assert all("public-search" in url for url in session.urls)
+    assert len(session.terms) > 1, "more than one search term is tried"
+
+
+def test_fetch_markets_keeps_markets_nested_under_events():
+    class EventOnlySession:
+        def get(self, url, params=None, timeout=None):
+            class R:
+                @staticmethod
+                def raise_for_status():
+                    return None
+
+                @staticmethod
+                def json():
+                    return {"events": [{"markets": [_raw()]}]}
+
+            return R()
+
+    assert len(fetch_markets(EventOnlySession())) == 1
+
+
+def test_build_quote_skips_celsius_markets():
+    """The forecast layer requests Fahrenheit and parse_bucket ignores the
+    unit, so a Celsius market would be scored against an F forecast and show
+    a large fake edge. It must be rejected outright."""
+    celsius = _raw(
+        question="Will the highest temperature in Seoul be 28°C on July 26?",
+        slug="highest-temperature-in-seoul-on-july-26",
+    )
+    assert build_quote(celsius, TODAY) is None
+
+
+def test_build_quote_still_accepts_fahrenheit_with_a_city_abbreviation():
+    """Guard against the Celsius regex tripping on strings like NYC."""
+    quote = build_quote(_raw(), TODAY)
+    assert quote is not None and quote.city_key == "nyc"
