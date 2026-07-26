@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Only main on push -- branch pushes that belong to a PR are already covered
+  # by the pull_request trigger, and listing both runs everything twice.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 permissions:
