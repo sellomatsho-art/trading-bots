@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local paper-trading state.
+simulation.json
+
+# There is nothing in this project that needs a .env, and nothing that reads
+# one. If a file like this ever appears, something has gone wrong.
+.env

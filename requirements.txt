@@ -1,0 +1,8 @@
+# Deliberately minimal. Every addition here is a package that gets to run code
+# on your machine, and this project handles no keys precisely so that a
+# compromised dependency has nothing to steal. Keep it that way.
+requests>=2.31
+flask>=3.0
+
+# Development only.
+pytest>=8.0
