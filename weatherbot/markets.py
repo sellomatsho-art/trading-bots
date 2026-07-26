@@ -17,7 +17,7 @@ from .cities import City, find_city
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 TIMEOUT = 30
-PAGE_SIZE = 500
+PAGE_SIZE = 100
 
 #: A market is a temperature market only if it says so.
 TEMPERATURE_RE = re.compile(r"\b(temperature|temp|degrees|high(?:est)? temp)\b", re.IGNORECASE)
@@ -49,6 +49,13 @@ _BELOW_EXCL_RE = re.compile(
     re.IGNORECASE,
 )
 _EXACT_RE = re.compile(rf"\bbe\s*{_NUM}\s*°\s*F?\b", re.IGNORECASE)
+
+#: Markets outside the US quote Celsius. The forecast layer requests
+#: Fahrenheit, and parse_bucket ignores the unit, so a "28C" market would
+#: be scored against an ~84F forecast and show a huge, entirely fake edge.
+#: Reject them rather than silently mispricing them.
+_CELSIUS_RE = re.compile(r"\d\s*(?:°\s*C\b|C\b)|celsius", re.IGNORECASE)
+
 
 
 def _first_group(match: re.Match) -> int:
@@ -189,6 +196,9 @@ def build_quote(raw: dict, today: date | None = None) -> MarketQuote | None:
     slug = raw.get("slug") or ""
     if not TEMPERATURE_RE.search(question):
         return None
+    # Fahrenheit-only: see _CELSIUS_RE.
+    if _CELSIUS_RE.search(question):
+        return None
 
     city: City | None = find_city(question) or find_city(slug)
     if city is None:
@@ -236,31 +246,60 @@ def _date_from_end(end_date: str | None) -> date | None:
     return parsed.astimezone(timezone.utc).date()
 
 
+SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+
+#: Weather markets are far too low-volume to appear in the volume-ordered
+#: listing, which also 422s past an offset ceiling of roughly 2000. Search
+#: reaches them directly.
+SEARCH_TERMS = ("highest temperature", "temperature", "degrees")
+
+
+def _search(http, term: str) -> list[dict]:
+    try:
+        resp = http.get(
+            SEARCH_URL,
+            params={"q": term, "limit_per_type": 100},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        raise MarketDataError(
+            f"could not reach the Polymarket search API: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise MarketDataError(f"search API returned invalid JSON: {exc}") from exc
+
+    markets = list(data.get("markets") or [])
+    for event in data.get("events") or []:
+        markets.extend(event.get("markets") or [])
+    return markets
+
+
+def _is_open(market: dict) -> bool:
+    """Search returns settled markets too; keep only live ones."""
+    if market.get("closed") is True:
+        return False
+    if market.get("active") is False:
+        return False
+    return True
+
+
 def fetch_markets(session: requests.Session | None = None, max_pages: int = 6) -> list[dict]:
-    """Page through open markets, most-traded first."""
+    """Collect open markets that plausibly concern temperature.
+
+    max_pages is retained for signature compatibility and is unused.
+    """
     http = session or requests
-    out: list[dict] = []
-    for page in range(max_pages):
-        params = {
-            "closed": "false",
-            "active": "true",
-            "limit": PAGE_SIZE,
-            "offset": page * PAGE_SIZE,
-            "order": "volumeNum",
-            "ascending": "false",
-        }
-        try:
-            resp = http.get(GAMMA_URL, params=params, timeout=TIMEOUT)
-            resp.raise_for_status()
-            batch = resp.json()
-        except requests.RequestException as exc:
-            raise MarketDataError(f"could not reach the Polymarket Gamma API: {exc}") from exc
-        if not batch:
-            break
-        out.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
-    return out
+    found: dict[str, dict] = {}
+    for term in SEARCH_TERMS:
+        for market in _search(http, term):
+            if not _is_open(market):
+                continue
+            key = str(market.get("id") or market.get("slug") or "")
+            if key:
+                found[key] = market
+    return list(found.values())
 
 
 def temperature_quotes(raw_markets: list[dict], today: date | None = None) -> list[MarketQuote]:
