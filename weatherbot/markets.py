@@ -15,9 +15,7 @@ import requests
 
 from .cities import City, find_city
 
-GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 TIMEOUT = 30
-PAGE_SIZE = 100
 
 #: A market is a temperature market only if it says so.
 TEMPERATURE_RE = re.compile(r"\b(temperature|temp|degrees|high(?:est)? temp)\b", re.IGNORECASE)
@@ -57,9 +55,9 @@ _EXACT_RE = re.compile(rf"\bbe\s*{_NUM}\s*°\s*F?\b", re.IGNORECASE)
 _CELSIUS_RE = re.compile(r"\d\s*(?:°\s*C\b|C\b)|celsius", re.IGNORECASE)
 
 
-
 def _first_group(match: re.Match) -> int:
     return int(next(g for g in match.groups() if g is not None))
+
 
 _MONTHS = (
     "january february march april may june july august "
@@ -285,11 +283,8 @@ def _is_open(market: dict) -> bool:
     return True
 
 
-def fetch_markets(session: requests.Session | None = None, max_pages: int = 6) -> list[dict]:
-    """Collect open markets that plausibly concern temperature.
-
-    max_pages is retained for signature compatibility and is unused.
-    """
+def fetch_markets(session: requests.Session | None = None) -> list[dict]:
+    """Collect open markets that plausibly concern temperature."""
     http = session or requests
     found: dict[str, dict] = {}
     for term in SEARCH_TERMS:
