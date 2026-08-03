@@ -59,16 +59,28 @@ def cmd_scan(args) -> int:
     for error in result.errors:
         print(f"  ! {error}", file=sys.stderr)
 
+    if result.uncalibrated:
+        print("\nheld back - no measured bias yet")
+        for city_key, seen, needed in result.uncalibrated:
+            print(f"  {city_key:<8} {seen}/{needed} station observations"
+                  f"  (forecast still logged; run `settle` after the date passes)")
+
     if result.signals:
         print("\ntop signals")
         for signal in result.signals[:10]:
             quote = signal.quote
+            bucket = quote.bucket
+            lo = "-inf" if bucket.low == float("-inf") else f"{bucket.low:.0f}"
+            hi = "inf" if bucket.high == float("inf") else f"{bucket.high:.0f}"
             print(
-                f"  [{signal.side:<3}] {quote.question[:64]:<64} "
-                f"price={signal.price:.3f} model={signal.model_prob:.3f} "
+                f"  [{signal.side:<3}] {quote.city_key:<8} {quote.target_date} "
+                f"[{lo},{hi}]F  price={signal.price:.3f} model={signal.model_prob:.3f} "
                 f"edge={signal.edge:+.3f} stake=${signal.stake:.2f} "
                 f"(fc {signal.forecast_mean:.1f}F +/-{signal.forecast_sigma:.1f})"
             )
+            # Full text, untruncated: the tail of the question carries the
+            # bucket and the date, and cutting it hid a real diagnosis.
+            print(f"          {quote.question}")
 
     print()
     _print_stats(ledger)

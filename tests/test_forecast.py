@@ -2,11 +2,15 @@ from datetime import date
 
 import pytest
 
+from weatherbot.cities import CITIES
 from weatherbot.forecast import (
     EnsembleForecast,
     ForecastError,
+    Observation,
+    _local_day_bounds_utc,
+    fetch_observed_high,
     parse_ensemble,
-    parse_observed_high,
+    parse_station_observations,
 )
 
 TARGET = date(2026, 7, 26)
@@ -85,17 +89,62 @@ def test_empty_ensemble_is_an_error():
         EnsembleForecast("nyc", TARGET, [])
 
 
-def test_parse_observed_high_picks_the_matching_day():
-    payload = {
-        "daily": {
-            "time": ["2026-07-25", "2026-07-26", "2026-07-27"],
-            "temperature_2m_max": [88.1, 91.7, 93.2],
-        }
-    }
-    assert parse_observed_high(payload, TARGET) == pytest.approx(91.7)
+def _obs(stamp, celsius):
+    return {"properties": {"timestamp": stamp, "temperature": {"value": celsius}}}
 
 
-def test_parse_observed_high_errors_when_the_day_is_absent():
-    payload = {"daily": {"time": ["2026-07-25"], "temperature_2m_max": [88.1]}}
-    with pytest.raises(ForecastError):
-        parse_observed_high(payload, TARGET)
+def test_parse_station_observations_takes_the_daily_max_in_fahrenheit():
+    payload = {"features": [
+        _obs("2026-07-26T14:00:00+00:00", 20.0),
+        _obs("2026-07-26T20:00:00+00:00", 30.0),   # 86F, the peak
+        _obs("2026-07-26T23:00:00+00:00", 25.0),
+    ]}
+    assert parse_station_observations(payload, TARGET, CITIES["nyc"]) == pytest.approx(86.0)
+
+
+def test_parse_station_observations_uses_the_LOCAL_day():
+    """A UTC day boundary would clip the west-coast afternoon peak.
+
+    22:00 UTC on the 26th is 15:00 local in LA -- the hottest part of the
+    target day, and it must be counted. 08:00 UTC on the 26th is 01:00 local
+    and belongs to the same local day; 08:00 UTC on the 27th does not.
+    """
+    payload = {"features": [
+        _obs("2026-07-26T22:00:00+00:00", 35.0),   # 15:00 PDT, in
+        _obs("2026-07-27T08:00:00+00:00", 40.0),   # 01:00 PDT next day, out
+    ]}
+    assert parse_station_observations(payload, TARGET, CITIES["la"]) == pytest.approx(95.0)
+
+
+def test_parse_station_observations_skips_null_readings():
+    payload = {"features": [
+        {"properties": {"timestamp": "2026-07-26T18:00:00+00:00",
+                        "temperature": {"value": None}}},
+        _obs("2026-07-26T19:00:00+00:00", 21.0),
+    ]}
+    assert parse_station_observations(payload, TARGET, CITIES["nyc"]) == pytest.approx(69.8)
+
+
+def test_parse_station_observations_errors_when_the_day_has_no_reading():
+    payload = {"features": [_obs("2026-07-20T18:00:00+00:00", 21.0)]}
+    with pytest.raises(ForecastError, match="no usable temperature"):
+        parse_station_observations(payload, TARGET, CITIES["nyc"])
+
+
+def test_local_day_bounds_span_exactly_one_day():
+    start, end = _local_day_bounds_utc(CITIES["la"], TARGET)
+    assert (end - start).total_seconds() == 24 * 3600
+    # LA is UTC-7 in July, so the local day starts at 07:00Z.
+    assert start.hour == 7
+
+
+def test_a_city_without_a_station_refuses_to_settle():
+    """The whole point of the rewrite: never silently fall back to the grid
+    the forecast came from."""
+    with pytest.raises(ForecastError, match="no independent station"):
+        fetch_observed_high(CITIES["london"], TARGET)
+
+
+def test_observation_carries_its_provenance():
+    obs = Observation(high_f=86.0, source="station", station="KLGA")
+    assert obs.source == "station" and obs.station == "KLGA"

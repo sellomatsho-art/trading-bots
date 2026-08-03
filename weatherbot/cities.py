@@ -19,6 +19,10 @@ class City:
     longitude: float
     timezone: str
     station: str
+    #: ICAO id of the station an independent observation can be read from.
+    #: None means no station feed exists for this city, which now blocks
+    #: trading it -- see Config.require_calibration.
+    station_id: str | None = None
     #: Lowercase substrings that identify this city in a market question.
     aliases: tuple[str, ...] = field(default_factory=tuple)
 
@@ -37,6 +41,7 @@ CITIES: dict[str, City] = {
             longitude=-73.8803,
             timezone="America/New_York",
             station="KLGA (LaGuardia)",
+            station_id="KLGA",
             aliases=("nyc", "new york"),
         ),
         City(
@@ -46,6 +51,7 @@ CITIES: dict[str, City] = {
             longitude=-87.9090,
             timezone="America/Chicago",
             station="KORD (O'Hare)",
+            station_id="KORD",
             aliases=("chicago",),
         ),
         City(
@@ -55,6 +61,7 @@ CITIES: dict[str, City] = {
             longitude=-118.3866,
             timezone="America/Los_Angeles",
             station="KLAX",
+            station_id="KLAX",
             aliases=("los angeles", "la ", "lax"),
         ),
         City(
@@ -64,6 +71,7 @@ CITIES: dict[str, City] = {
             longitude=-80.2906,
             timezone="America/New_York",
             station="KMIA",
+            station_id="KMIA",
             aliases=("miami",),
         ),
         City(
@@ -73,6 +81,7 @@ CITIES: dict[str, City] = {
             longitude=-97.6664,
             timezone="America/Chicago",
             station="KAUS",
+            station_id="KAUS",
             aliases=("austin",),
         ),
         City(
@@ -82,6 +91,7 @@ CITIES: dict[str, City] = {
             longitude=-104.6562,
             timezone="America/Denver",
             station="KDEN",
+            station_id="KDEN",
             aliases=("denver",),
         ),
         City(

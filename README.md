@@ -29,7 +29,7 @@ Both data sources are public, free and unauthenticated:
 | Source | Used for | Key needed |
 | --- | --- | --- |
 | [Open-Meteo ensemble API](https://open-meteo.com/en/docs/ensemble-api) | GFS `gfs025` — control run + 30 perturbed members | No |
-| [Open-Meteo forecast API](https://open-meteo.com/en/docs) | Observed daily highs, for settlement | No |
+| [NWS station observations](https://www.weather.gov/documentation/services-web-api) | Observed daily highs, for settlement | No |
 | [Polymarket Gamma API](https://docs.polymarket.com/) | Open markets and current prices (read-only) | No |
 
 ## How it prices a market
@@ -135,9 +135,10 @@ response shapes, so the suite runs offline.
 
 ## What this does not do
 
-- **Verify the settlement source.** Positions settle against Open-Meteo's
-  observation blend for the city's coordinates, not the official station report
-  Polymarket resolves on. Close enough to score a simulation; not exact.
+- **Match Polymarket's exact settlement.** Positions settle against the NWS
+  station feed (KLAX, KLGA, ...), taking the max of the hourly reports over the
+  local day. That tracks but does not always exactly equal the official
+  climate-report max, which uses 6-hourly max/min groups.
 - **Model the order book.** Fills are booked at the quoted price for the full
   size. Real books for these markets are thin, and that assumption is
   optimistic — often by more than the edge being chased.

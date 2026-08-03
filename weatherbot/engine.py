@@ -24,6 +24,9 @@ class ScanResult:
     signals: list[Signal] = field(default_factory=list)
     filled: list[Position] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    #: Cities held out of trading for want of calibration history, as
+    #: (city, observations_so_far, observations_needed).
+    uncalibrated: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 def scan(
@@ -47,6 +50,7 @@ def scan(
         if q.city_key in wanted and today <= q.target_date <= horizon
     ]
 
+    observed = ledger.observed_counts()
     needed = sorted({(q.city_key, q.target_date) for q in result.quotes})
     for city_key, target_date in needed:
         city = CITIES.get(city_key)
@@ -57,9 +61,16 @@ def scan(
         except ForecastError as exc:
             result.errors.append(str(exc))
             continue
+        # Record first, gate second: an uncalibrated city still needs its
+        # forecasts logged, or it can never accumulate the history that would
+        # let it trade. Learning and betting are separate permissions.
         ledger.record_forecast(
             city_key, target_date, forecast.mean, forecast.sigma, forecast.member_count
         )
+        seen = observed.get(city_key, 0)
+        if cfg.require_calibration and seen < cfg.min_calibration_samples:
+            result.uncalibrated.append((city_key, seen, cfg.min_calibration_samples))
+            continue
         bias = cfg.bias_correction.get(city_key, 0.0)
         result.forecasts[(city_key, target_date.isoformat())] = forecast.shifted(bias)
 
@@ -97,11 +108,13 @@ def settle_pending(
             errors.append(f"unknown city {city_key!r} in ledger")
             continue
         try:
-            actual = fetch_observed_high(city, target_date, session=session)
+            obs = fetch_observed_high(city, target_date, session=session)
         except ForecastError as exc:
             errors.append(str(exc))
             continue
-        settled.extend(ledger.settle(city_key, target_date, actual))
+        settled.extend(
+            ledger.settle(city_key, target_date, obs.high_f, source=obs.source)
+        )
 
     ledger.save()
     return settled, errors
