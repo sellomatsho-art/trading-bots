@@ -37,13 +37,13 @@ class FakeSession:
         self.observed = observed or {}
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, headers=None):
         self.calls.append(url)
         params = params or {}
         if "ensemble" in url:
             return FakeResponse(self._ensemble(params))
-        if "daily" in params:
-            return FakeResponse(self._observed(params))
+        if "observations" in url:
+            return FakeResponse(self._observed(url))
         # public-search returns grouped results as a dict, not a bare list.
         # fetch_markets queries several terms and dedupes by id, so serving
         # the same payload each time is fine.
@@ -74,15 +74,20 @@ class FakeSession:
         hourly["time"] = times
         return {"hourly": hourly}
 
-    def _observed(self, params):
-        city = self._city_for(params)
-        highs = self.observed[city]
-        return {
-            "daily": {
-                "time": [d.isoformat() for d in sorted(highs)],
-                "temperature_2m_max": [highs[d] for d in sorted(highs)],
-            }
-        }
+    def _observed(self, url):
+        """NWS station feed: hourly reports in Celsius, one peak per day."""
+        from weatherbot.cities import CITIES
+
+        station = url.rstrip("/").split("/")[-2]
+        city = next(c for c in CITIES.values() if c.station_id == station)
+        features = []
+        for day, high_f in self.observed[city.key].items():
+            # 20:00 UTC sits inside the local day for every US city here.
+            features.append({"properties": {
+                "timestamp": f"{day.isoformat()}T20:00:00+00:00",
+                "temperature": {"value": (high_f - 32) * 5 / 9},
+            }})
+        return {"features": features}
 
 
 def market(market_id, question, price, volume=25000):
@@ -101,6 +106,9 @@ def market(market_id, question, price, volume=25000):
 @pytest.fixture
 def cfg():
     return Config(
+        # These fixtures exercise signal generation, not the calibration gate;
+        # the gate has its own tests below.
+        require_calibration=False,
         cities=["nyc", "chicago"],
         bankroll=1000.0,
         min_edge=0.05,
@@ -259,3 +267,121 @@ def test_bias_correction_shifts_the_probabilities_a_scan_produces(cfg, tmp_path)
     assert len(result.filled) == 1
     assert result.signals[0].side == "YES"
     assert result.signals[0].forecast_mean == pytest.approx(85.0, abs=0.1)
+
+
+# --- the calibration gate --------------------------------------------------
+#
+# Added 3 Aug 2026, after the first live scan staked the per-position cap on
+# six signals while the ensemble sat ~5F above the market at both cities it
+# was trading. The bot bet hardest exactly where it had never once checked
+# itself against a real observation.
+
+
+def gated_cfg(**over):
+    cfg = Config(cities=["nyc", "chicago"], bankroll=1000.0, min_edge=0.05,
+                 min_volume=500, max_open_positions=5)
+    cfg.require_calibration = True
+    cfg.min_calibration_samples = 5
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _hot_market():
+    return [market("1", "Will the highest temperature in NYC on July 26 be 90-91°F?", 0.20)]
+
+
+def test_an_uncalibrated_city_is_not_traded(tmp_path):
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+
+    result = scan(gated_cfg(), ledger, session=session, today=TODAY)
+
+    assert result.filled == [], "no history, no bets"
+    assert result.signals == []
+    assert result.uncalibrated == [("nyc", 0, 5)]
+    assert ledger.cash == 1000
+
+
+def test_an_uncalibrated_city_still_records_its_forecast(tmp_path):
+    """Otherwise the gate is a deadlock: no trades, so no settlements, so no
+    observations, so the city can never qualify."""
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+
+    scan(gated_cfg(), ledger, session=session, today=TODAY)
+
+    assert [f.city_key for f in ledger.forecasts] == ["nyc"]
+    assert ledger.forecasts[0].mean == pytest.approx(90.0, abs=0.1)
+
+
+def test_the_gate_opens_once_enough_station_observations_exist(tmp_path):
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+    for i in range(5):
+        day = TODAY - timedelta(days=i + 1)
+        ledger.record_forecast("nyc", day, 90.0, 1.0, 31)
+        ledger.settle("nyc", day, actual_high=85.0, source="station")
+
+    result = scan(gated_cfg(), ledger, session=session, today=TODAY)
+
+    assert result.uncalibrated == []
+    assert len(result.filled) == 1
+
+
+def test_grid_observations_do_not_open_the_gate(tmp_path):
+    """Same count, wrong provenance: a grid-settled history is exactly the
+    self-grading the gate exists to stop."""
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+    for i in range(20):
+        day = TODAY - timedelta(days=i + 1)
+        ledger.record_forecast("nyc", day, 90.0, 1.0, 31)
+        ledger.settle("nyc", day, actual_high=85.0, source="grid")
+
+    result = scan(gated_cfg(), ledger, session=session, today=TODAY)
+
+    assert result.filled == []
+    assert result.uncalibrated == [("nyc", 0, 5)]
+
+
+def test_the_gate_is_per_city(tmp_path):
+    markets = _hot_market() + [
+        market("2", "Will the highest temperature in Chicago on July 26 be 80-81°F?", 0.20)]
+    session = FakeSession(markets, peaks={"nyc": 90.0, "chicago": 80.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+    for i in range(5):
+        day = TODAY - timedelta(days=i + 1)
+        ledger.record_forecast("nyc", day, 90.0, 1.0, 31)
+        ledger.settle("nyc", day, actual_high=85.0, source="station")
+
+    result = scan(gated_cfg(), ledger, session=session, today=TODAY)
+
+    assert [c for c, _, _ in result.uncalibrated] == ["chicago"]
+    assert {s.quote.city_key for s in result.signals} == {"nyc"}
+
+
+def test_the_gate_can_be_switched_off(tmp_path):
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+
+    result = scan(gated_cfg(require_calibration=False), ledger,
+                  session=session, today=TODAY)
+
+    assert len(result.filled) == 1 and result.uncalibrated == []
+
+
+def test_settlement_records_station_provenance(tmp_path):
+    session = FakeSession(_hot_market(), peaks={"nyc": 90.0})
+    ledger = Ledger(starting_bankroll=1000, cash=1000, path=tmp_path / "sim.json")
+    cfg = gated_cfg(require_calibration=False)
+    scan(cfg, ledger, session=session, today=TODAY)
+
+    session.observed = {"nyc": {TODAY: 90.3}}
+    settled, errors = settle_pending(cfg, ledger, session=session,
+                                     today=TODAY + timedelta(days=1))
+
+    assert errors == [] and len(settled) == 1
+    assert settled[0].actual_source == "station"
+    assert settled[0].actual_high == pytest.approx(90.3, abs=0.1)
+    assert ledger.observed_counts() == {"nyc": 1}

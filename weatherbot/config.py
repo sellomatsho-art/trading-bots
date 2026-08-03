@@ -55,6 +55,16 @@ class Config:
     #: produces overconfident buckets; this keeps probabilities honest.
     min_sigma_f: float = 1.5
 
+    #: Refuse to trade a city until its forecast has been scored against
+    #: enough independent station observations to measure a bias. Without
+    #: this the bot bets hardest exactly when it knows least -- on 3 Aug 2026
+    #: it staked the per-position cap on six signals while sitting ~5F above
+    #: the market at both cities it was trading.
+    require_calibration: bool = True
+
+    #: Independent observations a city needs before it may be traded.
+    min_calibration_samples: int = 5
+
     #: Per-city forecast bias in F, learned by `weatherbot calibrate` and
     #: subtracted from the raw ensemble. Positive => model runs hot.
     bias_correction: dict[str, float] = field(default_factory=dict)

@@ -42,6 +42,7 @@ class Position:
     forecast_sigma: float
     status: str = "open"
     actual_high: float | None = None
+    actual_source: str | None = None
     payout: float | None = None
     pnl: float | None = None
     settled_at: str | None = None
@@ -66,6 +67,7 @@ class ForecastRecord:
     members: int
     recorded_at: str
     actual_high: float | None = None
+    actual_source: str | None = None
 
     @property
     def error(self) -> float | None:
@@ -205,7 +207,8 @@ class Ledger:
         self.positions.append(position)
         return position
 
-    def settle(self, city_key: str, target_date: date, actual_high: float) -> list[Position]:
+    def settle(self, city_key: str, target_date: date, actual_high: float,
+               source: str = "station") -> list[Position]:
         """Settle every open position on a city/date and bank the payouts."""
         stamp = target_date.isoformat()
         settled: list[Position] = []
@@ -216,6 +219,7 @@ class Ledger:
             payout = round(position.contracts, 4) if won else 0.0
             position.status = "settled"
             position.actual_high = actual_high
+            position.actual_source = source
             position.payout = payout
             position.pnl = round(payout - position.stake, 4)
             position.settled_at = _now()
@@ -225,7 +229,19 @@ class Ledger:
         for record in self.forecasts:
             if record.city_key == city_key and record.target_date == stamp:
                 record.actual_high = actual_high
+                record.actual_source = source
         return settled
+
+    def observed_counts(self, source: str = "station") -> dict[str, int]:
+        """How many forecasts per city have been scored against a real
+        observation. This is the counter the trading guard reads: a city with
+        no independent history has no measured bias, so there is nothing to
+        correct and no business betting on it."""
+        counts: dict[str, int] = {}
+        for record in self.forecasts:
+            if record.actual_high is not None and record.actual_source == source:
+                counts[record.city_key] = counts.get(record.city_key, 0) + 1
+        return counts
 
     def pending_settlements(self, today: date | None = None) -> list[tuple[str, date]]:
         """City/date pairs that are in the past and still unsettled."""

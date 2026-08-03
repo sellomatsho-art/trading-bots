@@ -48,6 +48,11 @@ def learn_bias(
         error = record.error
         if error is None:
             continue
+        # Grid-sourced observations share the forecast's own bias, so an
+        # error measured against them is mostly the error cancelling with
+        # itself. Only station reports can move a bias.
+        if record.actual_source != "station":
+            continue
         by_city.setdefault(record.city_key, []).append(error)
 
     out: dict[str, CityBias] = {}

@@ -14,6 +14,7 @@ python -m weatherbot scan       # forecast, price, book paper fills
 python -m weatherbot settle     # score past-dated positions against observations
 python -m weatherbot calibrate  # learn per-city forecast bias
 python -m weatherbot report     # paper PnL
+python -m weatherbot reset      # archive the ledger and start clean
 python app.py                   # dashboard on http://localhost:5001
 ```
 
@@ -29,7 +30,7 @@ Both data sources are public, free and unauthenticated:
 | Source | Used for | Key needed |
 | --- | --- | --- |
 | [Open-Meteo ensemble API](https://open-meteo.com/en/docs/ensemble-api) | GFS `gfs025` — control run + 30 perturbed members | No |
-| [Open-Meteo forecast API](https://open-meteo.com/en/docs) | Observed daily highs, for settlement | No |
+| [NWS station observations](https://www.weather.gov/documentation/services-web-api) | Observed daily highs, for settlement | No |
 | [Polymarket Gamma API](https://docs.polymarket.com/) | Open markets and current prices (read-only) | No |
 
 ## How it prices a market
@@ -84,6 +85,33 @@ Measured bias is shrunk toward zero by `n / (n + 10)`, so a three-day fluke
 doesn't move the whole book. Expect to need a few weeks of history before the
 numbers mean anything.
 
+## Learn before you bet
+
+`require_calibration` (on by default) holds a city out of trading until its
+forecasts have been scored against `min_calibration_samples` real station
+observations. Forecasts are still logged for held-back cities, so the history
+accumulates while nothing is staked:
+
+```
+$ python -m weatherbot scan
+held back - no measured bias yet
+  la       0/5 station observations  (forecast still logged; run `settle` after the date passes)
+```
+
+This exists because of a live run on 3 August 2026. The ensemble sat ~5 F
+above the market at both cities being traded, the model reported 99%
+confidence, and every signal was staked at the per-position cap. The bot bet
+hardest where it had never once checked itself.
+
+It could not detect the problem because it settled against Open-Meteo at the
+same coordinates the forecast came from: a systematic grid error appeared on
+both sides of `forecast - observed` and cancelled. Settlement now reads the
+NWS station feed instead, observations carry provenance, and only
+station-sourced records can move a bias or open the gate.
+
+If a ledger was built before that fix, `reset` archives it and starts clean —
+an equity curve settled against the model's own grid is not a measurement.
+
 ## Configuration
 
 `config.json`, all trading parameters:
@@ -135,9 +163,10 @@ response shapes, so the suite runs offline.
 
 ## What this does not do
 
-- **Verify the settlement source.** Positions settle against Open-Meteo's
-  observation blend for the city's coordinates, not the official station report
-  Polymarket resolves on. Close enough to score a simulation; not exact.
+- **Match Polymarket's exact settlement.** Positions settle against the NWS
+  station feed (KLAX, KLGA, ...), taking the max of the hourly reports over the
+  local day. That tracks but does not always exactly equal the official
+  climate-report max, which uses 6-hourly max/min groups.
 - **Model the order book.** Fills are booked at the quoted price for the full
   size. Real books for these markets are thin, and that assumption is
   optimistic — often by more than the edge being chased.

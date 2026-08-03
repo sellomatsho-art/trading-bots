@@ -11,14 +11,19 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
 from .cities import City
 
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+#: Official station observations. Free, no key, and -- the point -- produced
+#: independently of the model the forecast comes from.
+NWS_STATIONS_URL = "https://api.weather.gov/stations"
+NWS_HEADERS = {"User-Agent": "weatherbot (paper trading research)",
+               "Accept": "application/geo+json"}
 DEFAULT_MODEL = "gfs025"
 TIMEOUT = 30
 
@@ -124,44 +129,101 @@ def fetch_ensemble(
     return parse_ensemble(resp.json(), city.key, target_date, model)
 
 
-def parse_observed_high(payload: dict, target_date: date) -> float:
-    """Pull the observed daily high for `target_date` out of a daily response."""
-    daily = payload.get("daily") or {}
-    times = daily.get("time") or []
-    highs = daily.get("temperature_2m_max") or []
-    stamp = target_date.isoformat()
-    for t, high in zip(times, highs):
-        if t == stamp and high is not None:
-            return float(high)
-    raise ForecastError(f"no observed high available for {stamp}")
+@dataclass(frozen=True)
+class Observation:
+    """A settled daily high, with where it came from.
+
+    Provenance is not decoration. Settling against the same Open-Meteo grid
+    the forecast is drawn from means a systematic grid error cancels on both
+    sides and the calibration loop cannot see it -- measured live on 3 Aug
+    2026, when the ensemble sat ~5F above the market at both LAX and LGA and
+    the bot was still grading itself as roughly right. Only `station`
+    observations are independent enough to learn a bias from.
+    """
+
+    high_f: float
+    source: str  # "station" or "grid"
+    station: str | None = None
+
+
+def _c_to_f(celsius: float) -> float:
+    return celsius * 9.0 / 5.0 + 32.0
+
+
+def _local_day_bounds_utc(city: City, target_date: date) -> tuple[datetime, datetime]:
+    """The city's local calendar day, expressed in UTC.
+
+    Markets settle on the local calendar day, so the window has to be built
+    in the city's zone and converted -- a UTC day boundary would clip the
+    afternoon peak on the US west coast.
+    """
+    tz = ZoneInfo(city.timezone)
+    start = datetime.combine(target_date, time.min, tzinfo=tz)
+    return start.astimezone(timezone.utc), (start + timedelta(days=1)).astimezone(timezone.utc)
+
+
+def parse_station_observations(payload: dict, target_date: date, city: City) -> float:
+    """Highest temperature reported by the station during the local day."""
+    features = payload.get("features") or []
+    start, end = _local_day_bounds_utc(city, target_date)
+    highs: list[float] = []
+    for feature in features:
+        props = (feature or {}).get("properties") or {}
+        temp = (props.get("temperature") or {}).get("value")
+        stamp = props.get("timestamp")
+        if temp is None or not stamp:
+            continue
+        try:
+            when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if start <= when < end:
+            highs.append(_c_to_f(float(temp)))
+    if not highs:
+        raise ForecastError(
+            f"station {city.station_id} reported no usable temperature for "
+            f"{target_date.isoformat()}"
+        )
+    return max(highs)
 
 
 def fetch_observed_high(
     city: City,
     target_date: date,
     session: requests.Session | None = None,
-) -> float:
-    """Fetch the realised daily high used to settle paper positions.
+) -> Observation:
+    """Read the realised daily high from the city's official station.
 
-    This is the reanalysis/observation blend for the city's coordinates, not
-    the official station report Polymarket resolves against. It is close enough
-    to score a simulation and is what keeps the whole pipeline key-free; treat
-    a settled paper PnL as indicative, not exact.
+    Uses the NWS observation feed, which is free, key-free and independent of
+    the model the forecast comes from. That independence is the whole point:
+    a bias the forecast and the settlement source share is invisible to
+    calibration.
+
+    Highs are taken as the max of the hourly/METAR reports over the local day,
+    which tracks but does not always exactly equal the official climate-report
+    max (that uses 6-hourly max/min groups). Close enough to score a paper
+    book; still not the resolution source Polymarket itself uses.
+
+    Cities with no station feed raise rather than silently falling back to the
+    grid -- see Observation.
     """
+    if not city.station_id:
+        raise ForecastError(
+            f"no independent station for {city.key}; refusing to settle against "
+            "the same grid the forecast came from"
+        )
     http = session or requests
-    days_back = (date.today() - target_date).days
+    start, end = _local_day_bounds_utc(city, target_date)
     params = {
-        "latitude": city.latitude,
-        "longitude": city.longitude,
-        "daily": "temperature_2m_max",
-        "temperature_unit": "fahrenheit",
-        "timezone": city.timezone,
-        "past_days": max(1, min(days_back + 1, 92)),
-        "forecast_days": 1,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 500,
     }
+    url = f"{NWS_STATIONS_URL}/{city.station_id}/observations"
     try:
-        resp = http.get(FORECAST_URL, params=params, timeout=TIMEOUT)
+        resp = http.get(url, params=params, timeout=TIMEOUT, headers=NWS_HEADERS)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        raise ForecastError(f"observation fetch failed for {city.key}: {exc}") from exc
-    return parse_observed_high(resp.json(), target_date)
+        raise ForecastError(f"station fetch failed for {city.station_id}: {exc}") from exc
+    high = parse_station_observations(resp.json(), target_date, city)
+    return Observation(high_f=high, source="station", station=city.station_id)

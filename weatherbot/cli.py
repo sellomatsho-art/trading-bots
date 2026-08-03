@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -19,7 +21,7 @@ from .calibration import learn_bias
 from .cities import CITIES
 from .config import Config
 from .engine import recalibrate, scan, settle_pending
-from .ledger import Ledger
+from .ledger import DEFAULT_LEDGER_PATH, Ledger
 from .markets import MarketDataError
 
 BANNER = "weatherbot - simulation only, no wallet, no order placement"
@@ -59,16 +61,28 @@ def cmd_scan(args) -> int:
     for error in result.errors:
         print(f"  ! {error}", file=sys.stderr)
 
+    if result.uncalibrated:
+        print("\nheld back - no measured bias yet")
+        for city_key, seen, needed in result.uncalibrated:
+            print(f"  {city_key:<8} {seen}/{needed} station observations"
+                  f"  (forecast still logged; run `settle` after the date passes)")
+
     if result.signals:
         print("\ntop signals")
         for signal in result.signals[:10]:
             quote = signal.quote
+            bucket = quote.bucket
+            lo = "-inf" if bucket.low == float("-inf") else f"{bucket.low:.0f}"
+            hi = "inf" if bucket.high == float("inf") else f"{bucket.high:.0f}"
             print(
-                f"  [{signal.side:<3}] {quote.question[:64]:<64} "
-                f"price={signal.price:.3f} model={signal.model_prob:.3f} "
+                f"  [{signal.side:<3}] {quote.city_key:<8} {quote.target_date} "
+                f"[{lo},{hi}]F  price={signal.price:.3f} model={signal.model_prob:.3f} "
                 f"edge={signal.edge:+.3f} stake=${signal.stake:.2f} "
                 f"(fc {signal.forecast_mean:.1f}F +/-{signal.forecast_sigma:.1f})"
             )
+            # Full text, untruncated: the tail of the question carries the
+            # bucket and the date, and cutting it hid a real diagnosis.
+            print(f"          {quote.question}")
 
     print()
     _print_stats(ledger)
@@ -146,6 +160,50 @@ def cmd_loop(args) -> int:
         time.sleep(args.interval * 60)
 
 
+def cmd_reset(args) -> int:
+    """Archive the paper ledger and start a fresh one.
+
+    Archives rather than deletes: a settled record is data, and the old one
+    is the evidence for whatever made you reset. The bias history is the
+    reason this exists -- positions settled against the model grid carry the
+    grid's own error, so an equity curve built on them is not a measurement
+    of anything and should not be carried into a clean run.
+
+    Note this is about the PnL record only. The calibration gate is already
+    safe on its own: observed_counts() requires source="station", so
+    grid-settled or legacy rows never open it.
+    """
+    cfg, ledger = _load(args)
+    path = Path(ledger.path or DEFAULT_LEDGER_PATH)
+    if not path.exists():
+        print(f"nothing to reset: {path} does not exist")
+        return 0
+
+    stats = ledger.stats()
+    observed = ledger.observed_counts()
+    print(f"{path}")
+    print(f"  {stats['settled_positions']} settled, {stats['open_positions']} open, "
+          f"equity ${stats['equity']:.2f}")
+    print(f"  {len(ledger.forecasts)} forecast records, "
+          f"{sum(observed.values())} scored against a station")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("refusing to reset non-interactively; pass --yes", file=sys.stderr)
+            return 1
+        if input("archive and start fresh? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("cancelled")
+            return 0
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+    path.rename(archive)
+    Ledger(starting_bankroll=cfg.bankroll, cash=cfg.bankroll, path=path).save()
+    print(f"\narchived to {archive.name}")
+    print(f"fresh ledger at ${cfg.bankroll:.2f}")
+    return 0
+
+
 def cmd_cities(args) -> int:
     for city in CITIES.values():
         print(f"  {city.key:<8} {city.name:<16} {city.station:<22} {city.timezone}")
@@ -178,6 +236,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("settle", help="score past-dated positions").set_defaults(func=cmd_settle)
     sub.add_parser("report", help="show paper PnL").set_defaults(func=cmd_report)
     sub.add_parser("cities", help="list supported cities").set_defaults(func=cmd_cities)
+
+    reset = sub.add_parser("reset", help="archive the ledger and start fresh")
+    reset.add_argument("--yes", action="store_true", help="skip the confirmation")
+    reset.set_defaults(func=cmd_reset)
 
     calibrate = sub.add_parser("calibrate", help="learn per-city forecast bias")
     calibrate.add_argument("--apply", action="store_true", help="write results to config.json")
