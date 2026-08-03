@@ -14,6 +14,7 @@ python -m weatherbot scan       # forecast, price, book paper fills
 python -m weatherbot settle     # score past-dated positions against observations
 python -m weatherbot calibrate  # learn per-city forecast bias
 python -m weatherbot report     # paper PnL
+python -m weatherbot reset      # archive the ledger and start clean
 python app.py                   # dashboard on http://localhost:5001
 ```
 
@@ -83,6 +84,33 @@ subsequent scan prices with that shift applied.
 Measured bias is shrunk toward zero by `n / (n + 10)`, so a three-day fluke
 doesn't move the whole book. Expect to need a few weeks of history before the
 numbers mean anything.
+
+## Learn before you bet
+
+`require_calibration` (on by default) holds a city out of trading until its
+forecasts have been scored against `min_calibration_samples` real station
+observations. Forecasts are still logged for held-back cities, so the history
+accumulates while nothing is staked:
+
+```
+$ python -m weatherbot scan
+held back - no measured bias yet
+  la       0/5 station observations  (forecast still logged; run `settle` after the date passes)
+```
+
+This exists because of a live run on 3 August 2026. The ensemble sat ~5 F
+above the market at both cities being traded, the model reported 99%
+confidence, and every signal was staked at the per-position cap. The bot bet
+hardest where it had never once checked itself.
+
+It could not detect the problem because it settled against Open-Meteo at the
+same coordinates the forecast came from: a systematic grid error appeared on
+both sides of `forecast - observed` and cancelled. Settlement now reads the
+NWS station feed instead, observations carry provenance, and only
+station-sourced records can move a bias or open the gate.
+
+If a ledger was built before that fix, `reset` archives it and starts clean —
+an equity curve settled against the model's own grid is not a measurement.
 
 ## Configuration
 
