@@ -79,17 +79,22 @@ _geocode_cache = {}
 def geocode_city(name):
     """Resolve a city name to (lat, lon) via Open-Meteo's geocoding API,
     cached in-memory. Handles "City (Station)" forms like "Seoul (Incheon)"
-    by falling back to the base name or the parenthetical alone."""
+    by trying the parenthetical first (that's the actual measurement
+    station these markets resolve against - e.g. "Seoul (Incheon)" means
+    the Incheon station, which can read meaningfully differently than
+    downtown Seoul), then the base city, then the full string."""
     if name in _geocode_cache:
         return _geocode_cache[name]
 
-    candidates = [name]
-    base = re.sub(r"\s*\([^)]*\)\s*", "", name).strip()
-    if base and base != name:
-        candidates.append(base)
+    candidates = []
     paren = re.search(r"\(([^)]+)\)", name)
     if paren:
         candidates.append(paren.group(1).strip())
+    base = re.sub(r"\s*\([^)]*\)\s*", "", name).strip()
+    if base and base not in candidates:
+        candidates.append(base)
+    if name not in candidates:
+        candidates.append(name)
 
     coords = None
     for candidate in candidates:

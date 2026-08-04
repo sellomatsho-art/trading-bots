@@ -57,8 +57,22 @@ class TestGeocodeCity(unittest.TestCase):
         self.assertEqual(mock_get.call_count, 1)
 
     @patch("weather_bot.requests.get")
-    def test_falls_back_to_base_name_when_parenthetical_form_fails(self, mock_get):
-        # First call (full "Seoul (Incheon)") returns no results, second
+    def test_prefers_parenthetical_station_over_base_city(self, mock_get):
+        # The parenthetical is the actual resolution station (e.g. Incheon,
+        # not downtown Seoul) and must be tried first, not last.
+        mock_get.return_value.raise_for_status.return_value = None
+        mock_get.return_value.json.return_value = {
+            "results": [{"latitude": 37.4602, "longitude": 126.4407}]  # Incheon, not Seoul
+        }
+        coords = wb.geocode_city("Seoul (Incheon)")
+        self.assertEqual(coords, (37.4602, 126.4407))
+        self.assertEqual(mock_get.call_count, 1)
+        _, kwargs = mock_get.call_args
+        self.assertEqual(kwargs["params"]["name"], "Incheon")
+
+    @patch("weather_bot.requests.get")
+    def test_falls_back_to_base_name_when_station_unresolvable(self, mock_get):
+        # First call (parenthetical "Incheon") returns no results, second
         # call (base name "Seoul") succeeds.
         empty = type("R", (), {"raise_for_status": lambda self: None,
                                 "json": lambda self: {"results": []}})()
