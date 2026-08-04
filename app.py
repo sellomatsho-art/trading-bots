@@ -4,6 +4,8 @@ import threading
 import time
 from datetime import datetime
 
+import weather_bot
+
 app = Flask(__name__)
 trades = []
 
@@ -23,9 +25,14 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return f"<h1>Polymarket Bot</h1><p>Status: Running</p><p>Trades: {len(trades)}</p>"
+    return f"<h1>Polymarket Bot</h1><p>Status: Running</p><p>Trades: {len(trades)}</p><p><a href='/weather'>Weather contract bot (paper trading)</a></p>"
+
+@app.route("/weather")
+def weather():
+    return weather_bot.render_status_html()
 
 threading.Thread(target=bot_loop, daemon=True).start()
+threading.Thread(target=weather_bot.weather_strategy_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=False)
