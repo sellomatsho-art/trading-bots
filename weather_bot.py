@@ -11,13 +11,18 @@ early once the market price runs up (rather than holding to resolution).
 NO REAL ORDERS ARE EVER PLACED. Everything here is simulated bookkeeping
 against live market prices/forecasts, tracked in PaperPortfolio.
 
-Network note: Polymarket's Gamma/CLOB APIs and Open-Meteo were not
-reachable from the sandbox this was built in (outbound network policy),
-so the exact JSON field names below are based on documented API shapes
-and could not be live-verified. fetch_active_markets(),
-get_outcome_info(), get_order_book() and multi_model_forecast_max() are
-the functions to double check first against a live response if trades
-aren't showing up as expected.
+Market discovery uses Gamma's public-search endpoint (confirmed live):
+querying "highest temperature" returns the active per-city "Highest
+temperature in <City> on <date>?" events, each containing ~11 sub-markets
+(one per temperature bucket). Only the two extreme buckets are phrased
+with "or higher"/"or below" - the ones parse_temperature_market() accepts
+- so only the tail contracts this strategy targets get considered; the
+~9 middle exact-value buckets are ignored by design. City coordinates are
+resolved dynamically via Open-Meteo's geocoding API rather than a fixed
+list, since the set of cities Polymarket covers changes and is larger
+than any reasonable hardcoded list (confirmed live: Hong Kong, Seoul
+(Incheon), Chongqing, Chengdu, Busan, Wellington and more, none of which
+would be in a short guessed list).
 """
 
 import json
@@ -31,9 +36,13 @@ from datetime import date, datetime
 import requests
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+PUBLIC_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless,meteofrance_seamless,jma_seamless"
+SEARCH_QUERY = "highest temperature"
+SEARCH_LIMIT = 50
 
 # Only buy inside roughly the price band the strategy this is modeled on used.
 MIN_PRICE = 0.003
@@ -55,70 +64,47 @@ MAX_DAYS_AHEAD = 6
 # agree closely doesn't produce an overconfident probability.
 MIN_STD_C = 1.2
 
-CITY_ALIASES = {
-    "new york city": "New York City", "new york": "New York City", "nyc": "New York City",
-    "los angeles": "Los Angeles",
-    "chicago": "Chicago",
-    "miami": "Miami",
-    "houston": "Houston",
-    "phoenix": "Phoenix",
-    "philadelphia": "Philadelphia",
-    "austin": "Austin",
-    "dallas": "Dallas",
-    "san antonio": "San Antonio",
-    "san diego": "San Diego",
-    "denver": "Denver",
-    "seattle": "Seattle",
-    "boston": "Boston",
-    "atlanta": "Atlanta",
-    "las vegas": "Las Vegas",
-    "washington dc": "Washington DC", "washington d.c.": "Washington DC",
-    "london": "London",
-    "paris": "Paris",
-    "moscow": "Moscow",
-    "tokyo": "Tokyo",
-    "sydney": "Sydney",
-}
-
-CITY_COORDS = {
-    "New York City": (40.7128, -74.0060),
-    "Los Angeles": (34.0522, -118.2437),
-    "Chicago": (41.8781, -87.6298),
-    "Miami": (25.7617, -80.1918),
-    "Houston": (29.7604, -95.3698),
-    "Phoenix": (33.4484, -112.0740),
-    "Philadelphia": (39.9526, -75.1652),
-    "Austin": (30.2672, -97.7431),
-    "Dallas": (32.7767, -96.7970),
-    "San Antonio": (29.4241, -98.4936),
-    "San Diego": (32.7157, -117.1611),
-    "Denver": (39.7392, -104.9903),
-    "Seattle": (47.6062, -122.3321),
-    "Boston": (42.3601, -71.0589),
-    "Atlanta": (33.7490, -84.3880),
-    "Las Vegas": (36.1699, -115.1398),
-    "Washington DC": (38.9072, -77.0369),
-    "London": (51.5074, -0.1278),
-    "Paris": (48.8566, 2.3522),
-    "Moscow": (55.7558, 37.6173),
-    "Tokyo": (35.6762, 139.6503),
-    "Sydney": (-33.8688, 151.2093),
-}
-
-_ALIASES_BY_LENGTH = sorted(CITY_ALIASES.items(), key=lambda kv: -len(kv[0]))
-
 _THRESHOLD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*°?\s*(F|C)\b", re.I)
 _DIRECTION_GTE_RE = re.compile(r"\bor\s+(higher|above|more|greater)\b", re.I)
 _DIRECTION_LTE_RE = re.compile(r"\bor\s+(lower|below|less)\b", re.I)
 _DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+# Matches "highest temperature in <City> be" / "... in <City> on" - covers
+# both "Will the highest temperature in Seoul (Incheon) be 28C ..." and any
+# phrasing that goes straight from city to date without "be".
+_CITY_RE = re.compile(r"highest temperature in (.+?)\s+(?:be|on)\b", re.I)
+
+_geocode_cache = {}
 
 
-def find_city(question):
-    ql = question.lower()
-    for alias, canonical in _ALIASES_BY_LENGTH:
-        if re.search(r"\b" + re.escape(alias) + r"\b", ql):
-            return canonical, CITY_COORDS[canonical]
-    return None, None
+def geocode_city(name):
+    """Resolve a city name to (lat, lon) via Open-Meteo's geocoding API,
+    cached in-memory. Handles "City (Station)" forms like "Seoul (Incheon)"
+    by falling back to the base name or the parenthetical alone."""
+    if name in _geocode_cache:
+        return _geocode_cache[name]
+
+    candidates = [name]
+    base = re.sub(r"\s*\([^)]*\)\s*", "", name).strip()
+    if base and base != name:
+        candidates.append(base)
+    paren = re.search(r"\(([^)]+)\)", name)
+    if paren:
+        candidates.append(paren.group(1).strip())
+
+    coords = None
+    for candidate in candidates:
+        try:
+            r = requests.get(GEOCODE_URL, params={"name": candidate, "count": 1}, timeout=10)
+            r.raise_for_status()
+            results = r.json().get("results")
+            if results:
+                coords = (results[0]["latitude"], results[0]["longitude"])
+                break
+        except Exception as e:
+            log_error(f"geocode_city[{candidate}]: {e}")
+
+    _geocode_cache[name] = coords
+    return coords
 
 
 def _fahrenheit_to_celsius(f):
@@ -128,18 +114,21 @@ def _fahrenheit_to_celsius(f):
 def parse_temperature_market(question, end_date_iso=None):
     """Best-effort parse of a Polymarket extreme-temperature-record question.
 
+    Only matches the extreme tail buckets ("... or higher" / "... or
+    below") - the ~9 middle exact-value buckets in each event are
+    intentionally ignored, matching the strategy's focus on cheap tail
+    contracts rather than the likely-priced middle of the distribution.
+
     Returns a dict with city/coords/threshold_c/direction/target_date, or
     None if the question doesn't look like this kind of market.
     """
-    ql = question.lower()
-    if "temperature" not in ql:
-        return None
-    if not any(k in ql for k in ("highest", "record", "high ")):
+    if "temperature" not in question.lower():
         return None
 
-    city, coords = find_city(question)
-    if not city:
+    city_m = _CITY_RE.search(question)
+    if not city_m:
         return None
+    city = city_m.group(1).strip()
 
     m = _THRESHOLD_RE.search(question)
     if not m:
@@ -164,6 +153,10 @@ def parse_temperature_market(question, end_date_iso=None):
         except ValueError:
             target_date = None
     if target_date is None:
+        return None
+
+    coords = geocode_city(city)
+    if coords is None:
         return None
 
     return {
@@ -231,29 +224,21 @@ def best_ask(book):
     return min(_price_of(a) for a in asks)
 
 
-def fetch_active_markets(limit=100, max_pages=5):
-    out = []
-    offset = 0
-    for _ in range(max_pages):
-        r = requests.get(GAMMA_MARKETS_URL, params={
-            "active": "true", "closed": "false", "limit": limit, "offset": offset,
-        }, timeout=15)
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-        out.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-    return out
-
-
 def fetch_temperature_markets():
-    return [
-        m for m in fetch_active_markets()
-        if "temperature" in m.get("question", "").lower()
-    ]
+    """The flat /markets list is huge (thousands of active markets, arbitrary
+    order) and paging through it misses these entirely - public-search finds
+    them directly by matching on the event title/description. Returns a flat
+    list of individual sub-markets (temperature buckets) across all matching
+    events."""
+    r = requests.get(PUBLIC_SEARCH_URL, params={
+        "q": SEARCH_QUERY, "limit_per_type": SEARCH_LIMIT,
+    }, timeout=15)
+    r.raise_for_status()
+    events = r.json().get("events", [])
+    markets = []
+    for e in events:
+        markets.extend(e.get("markets", []))
+    return markets
 
 
 def fetch_market_by_condition_id(condition_id):
@@ -391,10 +376,19 @@ def log_error(msg):
     _recent_errors.append(f"{datetime.now().isoformat(timespec='seconds')} {msg}")
 
 
-def manage_open_positions():
+def manage_open_positions(markets=None):
+    """markets: optionally the list already fetched this cycle by
+    scan_for_entries, keyed by conditionId - avoids a second full search
+    call. Falls back to a direct per-position lookup if a position's
+    market isn't in that list (e.g. it aged out of search results)."""
+    if not portfolio.open_positions:
+        return
+    by_condition_id = {m.get("conditionId"): m for m in (markets or []) if m.get("conditionId")}
     for key, pos in list(portfolio.open_positions.items()):
         try:
-            m = fetch_market_by_condition_id(pos["condition_id"])
+            m = by_condition_id.get(pos["condition_id"])
+            if m is None:
+                m = fetch_market_by_condition_id(pos["condition_id"])
             if m is None:
                 continue
             if m.get("closed"):
@@ -413,18 +407,15 @@ def manage_open_positions():
             log_error(f"manage_open_positions[{key}]: {e}")
 
 
-def scan_for_entries():
+def scan_for_entries(markets):
     if len(portfolio.open_positions) >= MAX_OPEN_POSITIONS:
-        return
-    try:
-        markets = fetch_temperature_markets()
-    except Exception as e:
-        log_error(f"fetch_temperature_markets: {e}")
         return
 
     for m in markets:
         if len(portfolio.open_positions) >= MAX_OPEN_POSITIONS:
             break
+        if m.get("closed"):
+            continue
         key = m.get("conditionId") or m.get("id")
         if not key or key in portfolio.open_positions:
             continue
@@ -462,9 +453,14 @@ def scan_for_entries():
 
 def weather_strategy_loop():
     while True:
+        markets = []
         try:
-            manage_open_positions()
-            scan_for_entries()
+            markets = fetch_temperature_markets()
+        except Exception as e:
+            log_error(f"fetch_temperature_markets: {e}")
+        try:
+            manage_open_positions(markets)
+            scan_for_entries(markets)
         except Exception as e:
             log_error(f"weather_strategy_loop: {e}")
         time.sleep(POLL_SECONDS)
