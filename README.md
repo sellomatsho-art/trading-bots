@@ -155,7 +155,7 @@ separate, manual, deliberate act.
 ## Testing
 
 ```bash
-python -m pytest -q     # 90 tests, no network
+python -m pytest -q     # 115 tests, no network
 ```
 
 The HTTP layer is faked at the `requests.Session` boundary using the documented
