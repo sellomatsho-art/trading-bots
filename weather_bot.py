@@ -25,8 +25,10 @@ than any reasonable hardcoded list (confirmed live: Hong Kong, Seoul
 would be in a short guessed list).
 """
 
+import csv
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -456,6 +458,198 @@ def scan_for_entries(markets):
         }, price, STAKE_USD)
 
 
+# ---------------------------------------------------------------------------
+# Shadow logging - records what the model PREDICTED, independently of what the
+# bot traded, so the model can be scored before anything is staked on it.
+#
+# Why this exists. should_buy() demands model_prob >= 4x the market price, and
+# at these prices that puts the decision 2-4 sigma into the tail, where the
+# number is a property of the distribution assumption rather than of the
+# forecast. Measured 4 Aug 2026 on a live Seattle contract: the raw 6-model
+# spread was 0.64C, MIN_STD_C floors it to 1.2, and that single substitution
+# moves the probability from 0.00008 to 0.02225 - a 268x change with no change
+# in the weather. Nudging the floor to 1.5 flips that market from no-trade to
+# trade. Until there is a calibration record, tuning that constant only picks
+# how often the bot fires, not whether it is right.
+#
+# Deliberately NOT wired into scan_for_entries(): trading behaviour must stay
+# byte-identical, so this is a separate pass that only reads and appends.
+#
+# Two design choices that matter:
+#
+#   1. The raw per-model temperatures are logged, not just the derived
+#      probability. Any sigma floor, lead-time sigma model or non-normal
+#      distribution can then be re-scored against history WITHOUT re-collecting
+#      six weeks of forecasts. The probability is a derived column; the
+#      ensemble is the actual observation.
+#   2. One row per (market, days_ahead), not one per poll. POLL_SECONDS=300
+#      would otherwise write ~288 near-identical rows per market per day and
+#      swamp any calibration with duplicates. Keying on lead time still lets a
+#      day-6 call and a day-0 call on the same market both be scored, which is
+#      the interesting comparison.
+#
+# Dedupe happens BEFORE the forecast call, so a cycle with nothing new to say
+# costs zero Open-Meteo requests. Only the price band is dropped relative to
+# scan_for_entries - the model is evaluated across the whole horizon window
+# (~56 markets vs the ~4 that clear MIN_PRICE), which is what makes the record
+# accumulate at a usable rate.
+SHADOW_CSV = "weather_shadow.csv"
+SHADOW_FIELDS = [
+    "logged_at", "condition_id", "question", "city", "target_date",
+    "days_ahead", "threshold_c", "direction", "market_price",
+    "model_prob", "would_buy", "n_models", "ensemble_temps_c",
+    "ensemble_mean_c", "ensemble_std_raw_c", "sigma_used_c", "min_std_c",
+    "resolved_at", "outcome", "resolve_price",
+]
+_shadow_seen = set()
+
+
+def _shadow_load_seen():
+    """(condition_id, days_ahead) pairs already written, so a restart does not
+    duplicate rows. Read once at import; the file is append-only afterwards."""
+    if not os.path.exists(SHADOW_CSV):
+        return
+    try:
+        with open(SHADOW_CSV, newline="") as f:
+            for row in csv.DictReader(f):
+                _shadow_seen.add((row.get("condition_id"), row.get("days_ahead")))
+    except Exception as e:
+        log_error(f"_shadow_load_seen: {e}")
+
+
+def _shadow_append(row):
+    new = not os.path.exists(SHADOW_CSV)
+    with open(SHADOW_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SHADOW_FIELDS, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def shadow_scan(markets):
+    """Score every in-horizon market and append one row per new
+    (market, days_ahead). Reads only; never buys, never touches portfolio."""
+    forecasts = {}
+    written = 0
+    for m in markets:
+        try:
+            if m.get("closed"):
+                continue
+            cid = m.get("conditionId") or m.get("id")
+            if not cid:
+                continue
+            parsed = parse_temperature_market(m.get("question", ""), m.get("endDate"))
+            if not parsed:
+                continue
+            days_ahead = (parsed["target_date"] - date.today()).days
+            if not (0 <= days_ahead <= MAX_DAYS_AHEAD):
+                continue
+            key = (cid, str(days_ahead))
+            if key in _shadow_seen:
+                continue            # dedupe BEFORE any network call
+            info = get_outcome_info(m)
+            if not info:
+                continue
+            fkey = (round(parsed["lat"], 3), round(parsed["lon"], 3),
+                    parsed["target_date"].isoformat())
+            if fkey not in forecasts:
+                forecasts[fkey] = multi_model_forecast_max(*fkey)
+            temps = forecasts[fkey]
+            if not temps or len(temps) < 2:
+                continue
+            mean = sum(temps) / len(temps)
+            var = sum((t - mean) ** 2 for t in temps) / (len(temps) - 1)
+            raw_std = var ** 0.5
+            prob = estimate_probability(temps, parsed["threshold_c"], parsed["direction"])
+            price = info["yes_price"]
+            _shadow_append({
+                "logged_at": datetime.now().isoformat(timespec="seconds"),
+                "condition_id": cid,
+                "question": m.get("question", ""),
+                "city": parsed["city"],
+                "target_date": parsed["target_date"].isoformat(),
+                "days_ahead": days_ahead,
+                "threshold_c": round(parsed["threshold_c"], 3),
+                "direction": parsed["direction"],
+                "market_price": price,
+                "model_prob": None if prob is None else round(prob, 6),
+                "would_buy": should_buy(price, prob),
+                "n_models": len(temps),
+                "ensemble_temps_c": json.dumps([round(t, 2) for t in temps]),
+                "ensemble_mean_c": round(mean, 3),
+                "ensemble_std_raw_c": round(raw_std, 3),
+                "sigma_used_c": round(max(raw_std, MIN_STD_C), 3),
+                "min_std_c": MIN_STD_C,
+                "resolved_at": "", "outcome": "", "resolve_price": "",
+            })
+            _shadow_seen.add(key)
+            written += 1
+        except Exception as e:
+            log_error(f"shadow_scan[{m.get('conditionId')}]: {e}")
+    return written
+
+
+def resolve_shadow_rows(limit=25):
+    """Fill in the outcome for logged predictions whose market has since
+    closed. Rewrites the file in place, so it is capped per pass and only runs
+    when there is something whose target date has already passed."""
+    if not os.path.exists(SHADOW_CSV):
+        return 0
+    try:
+        with open(SHADOW_CSV, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        log_error(f"resolve_shadow_rows read: {e}")
+        return 0
+
+    today = date.today().isoformat()
+    pending = [r for r in rows
+               if not r.get("outcome") and r.get("target_date", "9999") < today]
+    if not pending:
+        return 0
+
+    resolved = {}
+    for r in pending[:limit]:
+        cid = r["condition_id"]
+        if cid in resolved:
+            continue
+        try:
+            m = fetch_market_by_condition_id(cid)
+            if not m or not m.get("closed"):
+                continue
+            info = get_outcome_info(m)
+            if not info:
+                continue
+            yes = info["yes_price"]
+            resolved[cid] = ("YES" if yes > 0.5 else "NO", yes)
+        except Exception as e:
+            log_error(f"resolve_shadow_rows[{cid}]: {e}")
+
+    if not resolved:
+        return 0
+    stamp = datetime.now().isoformat(timespec="seconds")
+    n = 0
+    for r in rows:
+        if not r.get("outcome") and r["condition_id"] in resolved:
+            outcome, price = resolved[r["condition_id"]]
+            r["outcome"], r["resolve_price"], r["resolved_at"] = outcome, price, stamp
+            n += 1
+    try:
+        tmp = SHADOW_CSV + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=SHADOW_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        os.replace(tmp, SHADOW_CSV)
+    except Exception as e:
+        log_error(f"resolve_shadow_rows write: {e}")
+        return 0
+    return n
+
+
+_shadow_load_seen()
+
+
 def weather_strategy_loop():
     while True:
         markets = []
@@ -468,6 +662,13 @@ def weather_strategy_loop():
             scan_for_entries(markets)
         except Exception as e:
             log_error(f"weather_strategy_loop: {e}")
+        # Separate try: shadow logging is observational, and a failure in it
+        # must never stop the bot from trading or managing open positions.
+        try:
+            shadow_scan(markets)
+            resolve_shadow_rows()
+        except Exception as e:
+            log_error(f"shadow logging: {e}")
         time.sleep(POLL_SECONDS)
 
 

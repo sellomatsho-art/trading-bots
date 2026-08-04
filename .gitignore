@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+weather_shadow.csv
+weather_shadow.csv.tmp
