@@ -162,12 +162,16 @@ def _local_day_bounds_utc(city: City, target_date: date) -> tuple[datetime, date
     return start.astimezone(timezone.utc), (start + timedelta(days=1)).astimezone(timezone.utc)
 
 
-def parse_station_observations(payload: dict, target_date: date, city: City) -> float:
-    """Highest temperature reported by the station during the local day."""
-    features = payload.get("features") or []
-    start, end = _local_day_bounds_utc(city, target_date)
-    highs: list[float] = []
-    for feature in features:
+def parse_station_series(payload: dict, city: City) -> list[tuple[datetime, float]]:
+    """Every usable reading in the payload as (local time, degrees F).
+
+    Returned in the city's own zone and sorted, because the scalp needs to
+    ask "what was the max as of 6pm local" -- a question about the shape of
+    the day, not just its peak.
+    """
+    tz = ZoneInfo(city.timezone)
+    out: list[tuple[datetime, float]] = []
+    for feature in payload.get("features") or []:
         props = (feature or {}).get("properties") or {}
         temp = (props.get("temperature") or {}).get("value")
         stamp = props.get("timestamp")
@@ -177,14 +181,63 @@ def parse_station_observations(payload: dict, target_date: date, city: City) -> 
             when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
         except ValueError:
             continue
-        if start <= when < end:
-            highs.append(_c_to_f(float(temp)))
+        out.append((when.astimezone(tz), _c_to_f(float(temp))))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def parse_station_observations(payload: dict, target_date: date, city: City) -> float:
+    """Highest temperature reported by the station during the local day."""
+    highs = [t for when, t in parse_station_series(payload, city)
+             if when.date() == target_date]
     if not highs:
         raise ForecastError(
             f"station {city.station_id} reported no usable temperature for "
             f"{target_date.isoformat()}"
         )
     return max(highs)
+
+
+def fetch_station_series(
+    city: City,
+    start_date: date,
+    end_date: date,
+    session: requests.Session | None = None,
+    chunk_days: int = 7,
+) -> list[tuple[datetime, float]]:
+    """Readings across a local date range, inclusive.
+
+    Chunked because NWS caps `limit` at 500 and a station reports roughly
+    30 readings a day once specials are counted, so a month in one call
+    would silently truncate -- and a truncated history would quietly bias
+    the late-rise measurement toward whichever end of the window survived.
+    """
+    if not city.station_id:
+        raise ForecastError(f"no independent station for {city.key}")
+    http = session or requests
+    out: list[tuple[datetime, float]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_date)
+        start, _ = _local_day_bounds_utc(city, cursor)
+        _, end = _local_day_bounds_utc(city, chunk_end)
+        params = {
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": 500,
+        }
+        url = f"{NWS_STATIONS_URL}/{city.station_id}/observations"
+        try:
+            resp = http.get(url, params=params, timeout=TIMEOUT, headers=NWS_HEADERS)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise ForecastError(
+                f"station history fetch failed for {city.station_id}: {exc}"
+            ) from exc
+        out.extend(parse_station_series(resp.json(), city))
+        cursor = chunk_end + timedelta(days=1)
+    out.sort(key=lambda r: r[0])
+    return out
 
 
 def fetch_observed_high(
