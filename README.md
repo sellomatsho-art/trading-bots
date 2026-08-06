@@ -14,6 +14,7 @@ python -m weatherbot scan       # forecast, price, book paper fills
 python -m weatherbot settle     # score past-dated positions against observations
 python -m weatherbot calibrate  # learn per-city forecast bias
 python -m weatherbot report     # paper PnL
+python -m weatherbot scalp      # post-event scalp candidates for today
 python -m weatherbot reset      # archive the ledger and start clean
 python app.py                   # dashboard on http://localhost:5001
 ```
@@ -112,6 +113,54 @@ station-sourced records can move a bias or open the gate.
 If a ledger was built before that fix, `reset` archives it and starts clean —
 an equity curve settled against the model's own grid is not a measurement.
 
+## The post-event scalp
+
+A second strategy, and the first one here with an answer to *who is on the
+other side and why would they lose?*
+
+A city's daily high is set at the diurnal peak, usually early-to-mid
+afternoon. The market does not resolve until the local day ends. In between,
+the outcome is close to determined while the book may still be priced as
+though it were not — and the reason that persists is not a clever model, it
+is that a thin market at 7pm has nobody watching it.
+
+Two things make it different in kind from the forecast strategy:
+
+**It is an observation, not a prediction.** The max so far is a fact off the
+station feed. Buckets below it are already impossible, and that part needs no
+model at all.
+
+**The residual risk is measured.** The only thing that can still move the
+outcome is a further rise after the cutoff — and that is directly measurable
+from the same station's history. Pull the last 30 days, compare the max as of
+6pm with the max over the whole day, and the distribution of the difference
+*is* the risk. Because NWS serves arbitrary past ranges, this is available on
+the first run rather than after weeks of accumulation.
+
+```
+$ python -m weatherbot scalp
+
+Los Angeles (KLAX)
+  max so far 84.2F (rounds to 84) from 14 readings, last 17:53 local
+  late rise over 28 past days: +0F 89.7%, +1F 6.9%, +2F 3.4%
+    [NO ] [80,81]F  market=0.120 model=0.995  edge=+0.875
+```
+
+Report-only by design. The cheapest test of the hypothesis is to look once at
+whether the gaps exist at all; wiring it to the ledger first would be
+building on a guess, which is what the previous two strategies did.
+
+Known limits, stated up front rather than discovered later:
+
+- **Late rises are real.** Downslope wind — a Denver chinook, an LA Santa Ana
+  — can lift the temperature after sunset. That is exactly what the measured
+  distribution is for, and why nothing here assumes a probability of 1.
+- **Settlement source.** These are probabilities for the NWS station max. If
+  a market resolves on the 6-hourly climate-report max instead, the two can
+  differ by a degree, which on a two-degree bucket is the whole edge.
+- **A quote is not a fill.** A stale 0.70 on an untraded book is not
+  executable. Depth is not modelled.
+
 ## Configuration
 
 `config.json`, all trading parameters:
@@ -130,6 +179,12 @@ an equity curve settled against the model's own grid is not a measurement.
 | `probability_model` | `blend` | or `empirical` / `gaussian` |
 | `min_sigma_f` | 1.5 | Floor on ensemble spread, °F |
 | `bias_correction` | `{}` | Written by `calibrate --apply` |
+| `require_calibration` | `true` | Hold a city out of trading until its bias is measured |
+| `min_calibration_samples` | 5 | Station observations needed before a city trades |
+| `scalp_cutoff_hour` | 18 | Local hour after which the day's high is treated as mostly set |
+| `scalp_history_days` | 30 | Past days used to measure late-rise risk |
+| `scalp_min_samples` | 10 | Past days required before the rise distribution is trusted |
+| `scalp_min_edge` | 0.10 | Minimum \|model − market\| to report a candidate |
 
 ## No keys, by construction
 
@@ -155,7 +210,7 @@ separate, manual, deliberate act.
 ## Testing
 
 ```bash
-python -m pytest -q     # 115 tests, no network
+python -m pytest -q     # 134 tests, no network
 ```
 
 The HTTP layer is faked at the `requests.Session` boundary using the documented

@@ -20,5 +20,9 @@
   "min_sigma_f": 1.5,
   "bias_correction": {},
   "require_calibration": true,
-  "min_calibration_samples": 5
+  "min_calibration_samples": 5,
+  "scalp_cutoff_hour": 18,
+  "scalp_history_days": 30,
+  "scalp_min_samples": 10,
+  "scalp_min_edge": 0.1
 }

@@ -65,6 +65,24 @@ class Config:
     #: Independent observations a city needs before it may be traded.
     min_calibration_samples: int = 5
 
+    #: --- post-event scalp -------------------------------------------
+    #: Local hour after which today's high is treated as mostly settled.
+    #: Before this the diurnal peak may still be ahead and there is nothing
+    #: to scalp; 18:00 is late enough that the peak has passed on a normal
+    #: day and early enough to leave hours of market open.
+    scalp_cutoff_hour: int = 18
+
+    #: Days of station history used to measure the late-rise risk. NWS
+    #: serves arbitrary past ranges, so this is available on the first run
+    #: rather than something to accumulate.
+    scalp_history_days: int = 30
+
+    #: Past days required before the measured rise distribution is trusted.
+    scalp_min_samples: int = 10
+
+    #: Minimum |model - market| to report a scalp candidate.
+    scalp_min_edge: float = 0.10
+
     #: Per-city forecast bias in F, learned by `weatherbot calibrate` and
     #: subtracted from the raw ensemble. Positive => model runs hot.
     bias_correction: dict[str, float] = field(default_factory=dict)
