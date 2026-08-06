@@ -33,8 +33,13 @@ def _typical_day(day, peak=80.0, evening=None):
 
 # --- today's state ---------------------------------------------------------
 
+def _at(hour, minute=0, day=TODAY):
+    """A wall-clock moment in the city's own zone."""
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ)
+
+
 def test_day_state_takes_the_max_before_the_cutoff():
-    state = day_state(_typical_day(TODAY, peak=84.0), LA, TODAY, CUTOFF)
+    state = day_state(_typical_day(TODAY, peak=84.0), LA, TODAY, CUTOFF, _at(19))
     assert state.max_so_far == pytest.approx(84.0)
     assert state.rounded_max == 84
     assert state.last_reading_at.hour == 16, "16:00 is the last reading before 18"
@@ -42,23 +47,43 @@ def test_day_state_takes_the_max_before_the_cutoff():
 
 def test_day_state_ignores_readings_at_or_after_the_cutoff():
     """A 19:00 spike must not count toward the max we are treating as known."""
-    state = day_state(_typical_day(TODAY, peak=80.0, evening=95.0), LA, TODAY, CUTOFF)
+    state = day_state(_typical_day(TODAY, peak=80.0, evening=95.0), LA, TODAY,
+                      CUTOFF, _at(20))
     assert state.max_so_far == pytest.approx(80.0)
 
 
 def test_day_state_is_none_before_any_reading():
-    assert day_state([], LA, TODAY, CUTOFF) is None
+    assert day_state([], LA, TODAY, CUTOFF, _at(19)) is None
 
 
-def test_day_state_is_none_when_the_cutoff_has_not_been_reached():
-    """Pre-cutoff the peak may still be ahead, so there is nothing to scalp."""
-    morning = _series(TODAY, {6: 60.0, 9: 66.0})
-    assert day_state(morning, LA, TODAY, cutoff_hour=5) is None
+def test_day_state_is_none_when_the_CLOCK_has_not_reached_the_cutoff():
+    """The regression that shipped: readings existing before hour 18 is not
+    the same as the hour being past 18.
+
+    The earlier version of this test passed cutoff_hour=5 against readings at
+    06:00 and 09:00, so it returned None for lack of pre-cutoff readings and
+    never exercised the clock at all. Live at 10:20 local the real code
+    happily reported a "max so far" and would have priced markets as though
+    the day were settled, with the afternoon peak still ahead of it.
+    """
+    full_morning = _typical_day(TODAY, peak=80.0)
+    assert day_state(full_morning, LA, TODAY, CUTOFF, _at(10, 20)) is None
+    assert day_state(full_morning, LA, TODAY, CUTOFF, _at(17, 59)) is None
+    assert day_state(full_morning, LA, TODAY, CUTOFF, _at(18, 0)) is not None
+
+
+def test_day_state_is_none_when_the_city_is_on_a_different_date():
+    """Run from UTC+2 at 00:42, date.today() is tomorrow while LA is still in
+    yesterday afternoon. The city's calendar is the only one that counts."""
+    series = _typical_day(TODAY, peak=84.0)
+    tomorrow = TODAY + timedelta(days=1)
+    assert day_state(series, LA, tomorrow, CUTOFF, _at(19)) is None
+    assert day_state(series, LA, TODAY, CUTOFF, _at(19, day=tomorrow)) is None
 
 
 def test_day_state_ignores_other_days():
     series = _typical_day(TODAY - timedelta(days=1), peak=99.0) + _typical_day(TODAY, peak=70.0)
-    assert day_state(series, LA, TODAY, CUTOFF).max_so_far == pytest.approx(70.0)
+    assert day_state(series, LA, TODAY, CUTOFF, _at(19)).max_so_far == pytest.approx(70.0)
 
 
 # --- the measured residual risk -------------------------------------------

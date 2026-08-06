@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -68,14 +69,34 @@ class DayState:
         return round(self.max_so_far)
 
 
+def city_now(city: City) -> datetime:
+    """Wall-clock time in the city, which is the only clock that matters.
+
+    Everything about this strategy is anchored to the city's own day: when
+    its peak has passed, which date its markets settle on, which readings
+    count. The machine's clock is irrelevant and actively misleading — run
+    from UTC+2 at 00:42, `date.today()` returns tomorrow while every US city
+    is still in yesterday afternoon.
+    """
+    return datetime.now(ZoneInfo(city.timezone))
+
+
 def day_state(series: list[tuple[datetime, float]], city: City,
-              target_date: date, cutoff_hour: int) -> DayState | None:
+              target_date: date, cutoff_hour: int,
+              now_local: datetime) -> DayState | None:
     """Reduce today's readings up to the cutoff into a state, or None.
 
-    None means the day is not yet scalpable — either nothing has been
-    reported, or the local clock has not reached the cutoff, in which case
-    the peak may still be ahead and there is no edge to take.
+    None means the day is not yet scalpable.
+
+    `now_local` is required rather than derived, and the clock check is the
+    reason. An earlier version only asked whether any readings existed
+    before the cutoff hour — which is true at 10am, so it would happily
+    report a "max so far" at mid-morning and price markets as though the
+    day were settled. The peak had not happened yet. The docstring claimed
+    the clock was checked; the code never looked at it.
     """
+    if now_local.date() != target_date or now_local.hour < cutoff_hour:
+        return None
     today = [(when, t) for when, t in series
              if when.date() == target_date and when.hour < cutoff_hour]
     if not today:
@@ -171,6 +192,7 @@ def bucket_probability(state: DayState, bucket: Bucket,
 def fetch_scalp_inputs(city: City, target_date: date, cutoff_hour: int,
                        history_days: int,
                        session: requests.Session | None = None,
+                       now_local: datetime | None = None,
                        ) -> tuple[DayState | None, RiseDistribution, list]:
     """Today's state, the measured rise risk, and any days that came back short.
 
@@ -182,6 +204,7 @@ def fetch_scalp_inputs(city: City, target_date: date, cutoff_hour: int,
         raise ForecastError(f"no independent station for {city.key}")
     start = target_date - timedelta(days=history_days)
     series, truncated = fetch_station_series(city, start, target_date, session=session)
-    state = day_state(series, city, target_date, cutoff_hour)
+    state = day_state(series, city, target_date, cutoff_hour,
+                      now_local or city_now(city))
     dist = rise_distribution(late_rise_samples(series, cutoff_hour, target_date))
     return state, dist, truncated

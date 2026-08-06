@@ -26,7 +26,7 @@ from .engine import recalibrate, scan, settle_pending
 from .forecast import STATION_PAGE_LIMIT, ForecastError
 from .ledger import DEFAULT_LEDGER_PATH, Ledger
 from .markets import MarketDataError, fetch_markets, temperature_quotes
-from .scalp import bucket_probability, fetch_scalp_inputs
+from .scalp import bucket_probability, city_now, fetch_scalp_inputs
 
 BANNER = "weatherbot - simulation only, no wallet, no order placement"
 
@@ -174,35 +174,51 @@ def cmd_scalp(args) -> int:
     """
     cfg, _ = _load(args)
     session = _session()
-    today = date.today()
 
     try:
-        quotes = [q for q in temperature_quotes(fetch_markets(session), today)
-                  if q.target_date == today and q.city_key in set(cfg.cities)]
+        # Deliberately NOT filtered by a single "today": each city keeps its
+        # own calendar. Run from UTC+2 just after midnight, date.today() is
+        # tomorrow while every US city is still in yesterday afternoon, and
+        # a global filter throws away exactly the markets worth scalping.
+        quotes = [q for q in temperature_quotes(fetch_markets(session))
+                  if q.city_key in set(cfg.cities)]
     except MarketDataError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-    if not quotes:
-        print("no temperature markets settling today for the configured cities")
-        return 0
 
     by_city: dict[str, list] = {}
     for q in quotes:
         by_city.setdefault(q.city_key, []).append(q)
 
+    if not by_city:
+        print("no temperature markets found for the configured cities")
+        return 0
+
     candidates = 0
     for city_key in sorted(by_city):
         city = CITIES[city_key]
+        now_local = city_now(city)
+        local_today = now_local.date()
+        todays = [q for q in by_city[city_key] if q.target_date == local_today]
+
+        print(f"\n{city.name} ({city.station_id})  "
+              f"local {now_local:%a %d %b %H:%M}")
+        if not todays:
+            print(f"  no market settling {local_today} for this city")
+            continue
+        if now_local.hour < cfg.scalp_cutoff_hour:
+            print(f"  too early - cutoff is {cfg.scalp_cutoff_hour}:00 local, "
+                  f"the peak may still be ahead")
+            continue
+
         try:
             state, dist, truncated = fetch_scalp_inputs(
-                city, today, cfg.scalp_cutoff_hour, cfg.scalp_history_days,
-                session=session)
+                city, local_today, cfg.scalp_cutoff_hour, cfg.scalp_history_days,
+                session=session, now_local=now_local)
         except ForecastError as exc:
             print(f"  ! {exc}", file=sys.stderr)
             continue
 
-        print(f"\n{city.name} ({city.station_id})")
         if state is None:
             print(f"  nothing reported before {cfg.scalp_cutoff_hour}:00 local yet")
             continue
@@ -221,7 +237,7 @@ def cmd_scalp(args) -> int:
                            for k in range(0, dist.max_rise + 2))
         print(f"  late rise over {dist.samples} past days: {spread}")
 
-        for q in sorted(by_city[city_key], key=lambda x: x.bucket.low):
+        for q in sorted(todays, key=lambda x: x.bucket.low):
             model = bucket_probability(state, q.bucket, dist)
             for side, price, prob in (("YES", q.yes_price, model),
                                       ("NO", 1 - q.yes_price, 1 - model)):
