@@ -198,46 +198,64 @@ def parse_station_observations(payload: dict, target_date: date, city: City) -> 
     return max(highs)
 
 
+#: NWS caps `limit` at 500 per request.
+STATION_PAGE_LIMIT = 500
+
+
 def fetch_station_series(
     city: City,
     start_date: date,
     end_date: date,
     session: requests.Session | None = None,
-    chunk_days: int = 7,
-) -> list[tuple[datetime, float]]:
-    """Readings across a local date range, inclusive.
+) -> tuple[list[tuple[datetime, float]], list[date]]:
+    """Readings across a local date range, plus the days that came back short.
 
-    Chunked because NWS caps `limit` at 500 and a station reports roughly
-    30 readings a day once specials are counted, so a month in one call
-    would silently truncate -- and a truncated history would quietly bias
-    the late-rise measurement toward whichever end of the window survived.
+    One request per local day, and it checks for truncation rather than
+    assuming a reporting rate. The first version chunked seven days at a
+    time on the assumption a station reports ~30 times a day; measured live
+    on 6 Aug 2026, KLGA had already filed 139 readings before 10:20 local,
+    i.e. roughly every five minutes and ~300 a day. Each chunk therefore hit
+    the 500 cap after a day and a half and silently dropped the rest, so a
+    30-day request yielded 3-4 usable days.
+
+    That failure is invisible in the data -- a short history still produces
+    a confident-looking distribution -- so truncation is now detected and
+    reported instead of inferred. A day whose response comes back at the cap
+    is returned in `truncated` and must not be used to measure anything: the
+    API returns the most recent readings, so a capped day is missing its
+    morning, which is exactly the part the pre-cutoff max is drawn from.
     """
     if not city.station_id:
         raise ForecastError(f"no independent station for {city.key}")
     http = session or requests
+    url = f"{NWS_STATIONS_URL}/{city.station_id}/observations"
     out: list[tuple[datetime, float]] = []
+    truncated: list[date] = []
+
     cursor = start_date
     while cursor <= end_date:
-        chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_date)
-        start, _ = _local_day_bounds_utc(city, cursor)
-        _, end = _local_day_bounds_utc(city, chunk_end)
+        start, end = _local_day_bounds_utc(city, cursor)
         params = {
             "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "limit": 500,
+            "limit": STATION_PAGE_LIMIT,
         }
-        url = f"{NWS_STATIONS_URL}/{city.station_id}/observations"
         try:
             resp = http.get(url, params=params, timeout=TIMEOUT, headers=NWS_HEADERS)
             resp.raise_for_status()
+            payload = resp.json()
         except requests.RequestException as exc:
             raise ForecastError(
                 f"station history fetch failed for {city.station_id}: {exc}"
             ) from exc
-        out.extend(parse_station_series(resp.json(), city))
-        cursor = chunk_end + timedelta(days=1)
+        if len(payload.get("features") or []) >= STATION_PAGE_LIMIT:
+            truncated.append(cursor)
+        else:
+            out.extend(parse_station_series(payload, city))
+        cursor += timedelta(days=1)
+
     out.sort(key=lambda r: r[0])
-    return out
+    return out, truncated
 
 
 def fetch_observed_high(

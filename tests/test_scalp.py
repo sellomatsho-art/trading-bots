@@ -174,3 +174,74 @@ def test_mass_sums_to_about_one_across_a_covering_ladder():
                Bucket(86, 86), Bucket(87, float("inf"))]
     total = sum(bucket_probability(state, b, dist) for b in buckets)
     assert 0.98 < total < 1.03, total
+
+
+# --- history truncation ----------------------------------------------------
+#
+# Measured live 6 Aug 2026: KLGA had filed 139 readings before 10:20 local,
+# ~300 a day. The original 7-day chunks hit the 500 cap after ~1.5 days, so a
+# 30-day request produced 3-4 usable days -- and a 3-day history still yields
+# a confident-looking distribution, which is the dangerous kind of wrong.
+
+from weatherbot.forecast import STATION_PAGE_LIMIT, fetch_station_series  # noqa: E402
+
+
+class _StationStub:
+    """Serves per-day payloads; days listed in `capped` return the full cap."""
+
+    def __init__(self, capped=(), readings_per_day=12):
+        self.capped = set(capped)
+        self.readings_per_day = readings_per_day
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        start = datetime.fromisoformat(params["start"].replace("Z", "+00:00"))
+        day = start.astimezone(TZ).date()
+        self.calls.append(day)
+        n = STATION_PAGE_LIMIT if day in self.capped else self.readings_per_day
+        feats = [{"properties": {
+            "timestamp": (start + timedelta(minutes=5 * i)).isoformat().replace("+00:00", "Z"),
+            "temperature": {"value": 20.0}}} for i in range(n)]
+
+        class R:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"features": feats}
+
+        return R()
+
+
+def test_history_is_fetched_one_day_at_a_time():
+    """Seven-day chunks are what caused the silent truncation."""
+    stub = _StationStub()
+    start, end = TODAY - timedelta(days=4), TODAY
+    fetch_station_series(LA, start, end, session=stub)
+    assert stub.calls == [start + timedelta(days=i) for i in range(5)]
+
+
+def test_a_capped_day_is_reported_not_silently_kept():
+    """The API returns the most recent readings, so a capped day is missing
+    its morning -- exactly the part the pre-cutoff max comes from."""
+    capped = TODAY - timedelta(days=2)
+    stub = _StationStub(capped=[capped])
+    series, truncated = fetch_station_series(LA, TODAY - timedelta(days=4), TODAY,
+                                             session=stub)
+    assert truncated == [capped]
+    assert all(when.date() != capped for when, _ in series), "capped day excluded"
+
+
+def test_a_clean_history_reports_nothing_truncated():
+    series, truncated = fetch_station_series(LA, TODAY - timedelta(days=3), TODAY,
+                                             session=_StationStub())
+    assert truncated == []
+    assert series, "readings still come back"
+
+
+def test_readings_come_back_sorted():
+    series, _ = fetch_station_series(LA, TODAY - timedelta(days=3), TODAY,
+                                     session=_StationStub())
+    assert series == sorted(series, key=lambda r: r[0])

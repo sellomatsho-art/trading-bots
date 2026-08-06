@@ -23,7 +23,7 @@ from .calibration import learn_bias
 from .cities import CITIES
 from .config import Config
 from .engine import recalibrate, scan, settle_pending
-from .forecast import ForecastError
+from .forecast import STATION_PAGE_LIMIT, ForecastError
 from .ledger import DEFAULT_LEDGER_PATH, Ledger
 from .markets import MarketDataError, fetch_markets, temperature_quotes
 from .scalp import bucket_probability, fetch_scalp_inputs
@@ -195,7 +195,7 @@ def cmd_scalp(args) -> int:
     for city_key in sorted(by_city):
         city = CITIES[city_key]
         try:
-            state, dist = fetch_scalp_inputs(
+            state, dist, truncated = fetch_scalp_inputs(
                 city, today, cfg.scalp_cutoff_hour, cfg.scalp_history_days,
                 session=session)
         except ForecastError as exc:
@@ -209,9 +209,13 @@ def cmd_scalp(args) -> int:
         print(f"  max so far {state.max_so_far:.1f}F (rounds to {state.rounded_max}) "
               f"from {state.readings} readings, last {state.last_reading_at:%H:%M} local")
 
+        if truncated:
+            print(f"  ! {len(truncated)} day(s) hit the {STATION_PAGE_LIMIT}-reading "
+                  f"cap and were dropped, not measured", file=sys.stderr)
         if dist.samples < cfg.scalp_min_samples:
             print(f"  late-rise risk unmeasured: {dist.samples}/{cfg.scalp_min_samples} "
-                  f"past days - not pricing anything")
+                  f"past days of {cfg.scalp_history_days} requested "
+                  f"- not pricing anything")
             continue
         spread = ", ".join(f"+{k}F {dist.probability(k):.1%}"
                            for k in range(0, dist.max_rise + 2))
