@@ -146,6 +146,12 @@ Los Angeles (KLAX)
     [NO ] [80,81]F  market=0.120 model=0.995  edge=+0.875
 ```
 
+Every check is anchored to the **city's** clock, never the machine's. Run from
+UTC+2 just after midnight, `date.today()` returns tomorrow while every US city
+is still in yesterday afternoon — a single global "today" throws away exactly
+the markets worth scalping, and a cutoff compared against the wrong clock
+prices a market at 10am as though the day were over.
+
 Report-only by design. The cheapest test of the hypothesis is to look once at
 whether the gaps exist at all; wiring it to the ledger first would be
 building on a guess, which is what the previous two strategies did.
@@ -219,7 +225,7 @@ separate, manual, deliberate act.
 ## Testing
 
 ```bash
-python -m pytest -q     # 138 tests, no network
+python -m pytest -q     # 139 tests, no network
 ```
 
 The HTTP layer is faked at the `requests.Session` boundary using the documented
