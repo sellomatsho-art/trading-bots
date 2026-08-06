@@ -150,6 +150,15 @@ Report-only by design. The cheapest test of the hypothesis is to look once at
 whether the gaps exist at all; wiring it to the ledger first would be
 building on a guess, which is what the previous two strategies did.
 
+History is fetched one local day per request, and a day whose response comes
+back at the API's 500-reading cap is **dropped and reported**, never measured
+from. These stations report roughly every five minutes — KLGA had filed 139
+readings before 10:20 local on 6 Aug — so a multi-day request silently
+truncates, and a three-day history still produces a confident-looking
+distribution. That is the dangerous kind of wrong, so it is detected rather
+than assumed away. Expect `scalp` to take a minute or so per city as a
+result.
+
 Known limits, stated up front rather than discovered later:
 
 - **Late rises are real.** Downslope wind — a Denver chinook, an LA Santa Ana
@@ -210,7 +219,7 @@ separate, manual, deliberate act.
 ## Testing
 
 ```bash
-python -m pytest -q     # 134 tests, no network
+python -m pytest -q     # 138 tests, no network
 ```
 
 The HTTP layer is faked at the `requests.Session` boundary using the documented

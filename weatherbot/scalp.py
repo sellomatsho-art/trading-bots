@@ -171,12 +171,17 @@ def bucket_probability(state: DayState, bucket: Bucket,
 def fetch_scalp_inputs(city: City, target_date: date, cutoff_hour: int,
                        history_days: int,
                        session: requests.Session | None = None,
-                       ) -> tuple[DayState | None, RiseDistribution]:
-    """One station call covering both today and the history it is judged by."""
+                       ) -> tuple[DayState | None, RiseDistribution, list]:
+    """Today's state, the measured rise risk, and any days that came back short.
+
+    Truncated days are surfaced rather than swallowed: a short history still
+    produces a confident-looking distribution, which is the worst kind of
+    wrong here.
+    """
     if not city.station_id:
         raise ForecastError(f"no independent station for {city.key}")
     start = target_date - timedelta(days=history_days)
-    series = fetch_station_series(city, start, target_date, session=session)
+    series, truncated = fetch_station_series(city, start, target_date, session=session)
     state = day_state(series, city, target_date, cutoff_hour)
     dist = rise_distribution(late_rise_samples(series, cutoff_hour, target_date))
-    return state, dist
+    return state, dist, truncated
